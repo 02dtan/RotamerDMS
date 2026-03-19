@@ -1,0 +1,58 @@
+{
+  "timestamp": "20260312_154552",
+  "phase": "rotamer_sampling",
+  "estimated_final_volume": 314.93,
+  "volume_increase": 254.45000000000002,
+  "best_rotamers": [
+    {
+      "chain": "A",
+      "resnum": 102,
+      "resname": "MET",
+      "best_rotamer_idx": 11
+    },
+    {
+      "chain": "A",
+      "resnum": 153,
+      "resname": "PHE",
+      "best_rotamer_idx": 4
+    },
+    {
+      "chain": "A",
+      "resnum": 114,
+      "resname": "PHE",
+      "best_rotamer_idx": 1
+    }
+  ],
+  "residue_details": [
+    {
+      "chain": "A",
+      "resnum": 102,
+      "resname": "MET",
+      "best_rotamer_idx": 11,
+      "best_volume_change": 119.66,
+      "best_percentage": 2.7,
+      "native_percentage": 15.3,
+      "num_rotamers_tested": 26
+    },
+    {
+      "chain": "A",
+      "resnum": 153,
+      "resname": "PHE",
+      "best_rotamer_idx": 4,
+      "best_volume_change": 70.85000000000002,
+      "best_percentage": 7.2,
+      "native_percentage": 30.8,
+      "num_rotamers_tested": 20
+    },
+    {
+      "chain": "A",
+      "resnum": 114,
+      "resname": "PHE",
+      "best_rotamer_idx": 1,
+      "best_volume_change": 63.94,
+      "best_percentage": 30.8,
+      "native_percentage": 30.8,
+      "num_rotamers_tested": 20
+    }
+  ]
+}
