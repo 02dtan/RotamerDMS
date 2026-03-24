@@ -68,7 +68,7 @@ RotamerDMS/
 | Inner probe radius | 1.4 Å | `probe_in` |
 | Outer probe radius | 4.0 Å | `probe_out` |
 | Exterior trim distance | 2.4 Å | `removal_distance` |
-| Minimum cavity volume | 5.0 ų | `volume_cutoff` |
+| Minimum cavity volume | 5.0 Å³ | `volume_cutoff` |
 
 **Key Functions**:
 - `detect_cavities(struct, params)`: Run pyKVFinder on a structure, returns volumes and residue contacts
@@ -117,6 +117,8 @@ RotamerDMS/
 **Purpose**: Rotamer sampling phase - sample states and select volume-maximizing rotamers.
 
 **Key Functions**:
+- `get_current_chi_angles(struct, residue)`: Measure chi dihedral angles of a residue
+- `find_closest_library_rotamer(struct, chain, resnum)`: Find library rotamer matching current conformation
 - `get_rotamer_library(struct, chain, resnum)`: Load Schrodinger backbone-dependent rotamer library
 - `sample_rotamers_for_residue(...)`: Test all rotamer states for one residue, rank by volume impact
 - `run_rotamer_sampling_phase(...)`: Main driver - process residues in priority order
@@ -126,18 +128,25 @@ RotamerDMS/
 **Algorithm** (per design.md):
 1. Process residues in order of volume impact (from mutation phase)
 2. For each residue:
+   - Identify current/native rotamer by comparing chi angles to library
+   - Record native rotamer probability (p_curr)
    - Load backbone-dependent rotamer library
    - Test each rotamer state, measure volume change
-   - Record `rotamer.percentage` for each state
+   - Record `rotamer.percentage` (p_sugg) for each state
+   - Compute ΔG = -ln(p_sugg / p_curr) for each state (in arbitrary units)
    - Sort states by volume contribution (descending)
 3. Apply best rotamer for each residue to working structure
 4. Final verification with pyKVfinder
 5. Save with appropriate filename (flag if multiple pockets persist)
 
 **Implementation Notes**:
-- Uses `rotamer.percentage` attribute for frequency proxy
+- Native rotamer identified by minimizing angular distance in chi-space (periodicity-aware)
+- Symmetry handling for PHE, TYR (χ2), ASP (χ2), GLU (χ3) - 180° flips are equivalent
+- Uses `measure_dihedral_angle` from `schrodinger.structutils.measure` for chi angle measurement
+- Uses `rotamer.percentage` / `rotamer.probability` for Boltzmann probability
+- ΔG = -ln(p_sugg / p_curr) in arbitrary units (AU); ΔG = 0 when suggested = native
 - Accumulates best rotamers progressively (each residue sampled in context of prior changes)
-- Saves checkpoint JSON with per-residue rotamer details
+- Saves checkpoint JSON with per-residue rotamer details including ΔG values
 
 ---
 
@@ -263,3 +272,875 @@ cat checkpoints/rotamer_sampling_*.json
   - Mutation phase with Ala scanning
   - Rotamer sampling with percentage extraction
   - Main runner script and shell wrapper
+
+---
+
+## Session: March 19, 2026 - WCA Potential & Multi-Objective Optimization
+
+### Overview
+
+Extended rotamer sampling to consider multiple objectives:
+1. **Pocket volume maximization** (original objective)
+2. **Steric clash avoidance** via WCA potential
+3. **Conformational free energy** (deltaG)
+4. **Pareto front analysis** for tradeoff visualization
+
+---
+
+### 1. WCA Potential Implementation
+
+#### Background: What is the WCA Potential?
+
+The **Weeks-Chandler-Andersen (WCA) potential** is a repulsive-only variant of the Lennard-Jones potential, isolating steric repulsion by truncating at the LJ minimum:
+
+```
+For r ≤ r_min = 2^(1/6)σ:
+    U_WCA(r) = 4ε[(σ/r)^12 - (σ/r)^6] + ε
+
+For r > r_min:
+    U_WCA(r) = 0
+```
+
+This captures "steric clashes" - when atoms are too close, energy increases sharply.
+
+#### Implementation Choice: PyRosetta's `fa_rep` Term
+
+**Decision**: Use PyRosetta's `fa_rep` (full-atom repulsive) energy term as WCA proxy.
+
+**Justification**:
+1. **Physical equivalence**: `fa_rep` implements repulsive LJ, conceptually identical to WCA
+2. **Optimized implementation**: PyRosetta uses pre-computed neighbor lists, avoiding O(N²) iteration
+3. **Validated parameters**: Rosetta's ref2015 energy function is extensively validated
+4. **No manual cutoff needed**: PyRosetta handles distance cutoffs via neighbor detection
+
+#### New File: `src/wca_potential.py` (179 lines)
+
+```python
+def _init_pyrosetta():
+    """
+    Lazy initialization of PyRosetta.
+    
+    Justification: PyRosetta init is expensive (~2-3 sec). Lazy init ensures
+    cost is paid only once per session, only if WCA computation is requested.
+    """
+
+def schrodinger_to_pyrosetta_pose(schrodinger_struct):
+    """
+    Convert Schrodinger Structure to PyRosetta Pose via temporary PDB file.
+    
+    Justification: Schrodinger and PyRosetta use incompatible internal
+    representations. PDB is universal interchange format both can read/write.
+    Temp file cleaned up immediately after conversion.
+    """
+
+def compute_wca_batch(schrodinger_struct, target_chain, target_resnum, verbose=False):
+    """
+    Compute WCA/fa_rep energy for a specific residue.
+    
+    Implementation:
+    1. Convert structure to PyRosetta pose
+    2. Create minimal score function with only fa_rep (weight=1.0)
+    3. Score pose (populates energy graph using neighbor lists)
+    4. Extract per-residue fa_rep energy
+    
+    Justification for minimal score function:
+    - Only fa_rep avoids computing unnecessary energy terms
+    - Weight 1.0 gives energy in Rosetta Energy Units (REU)
+    - REU interpretable: >5 REU suggests significant clash
+    """
+
+def get_wca_energy(schrodinger_struct, chain, resnum, verbose=False):
+    """
+    Simple interface returning WCA energy as float or None.
+    Returns None on failure for graceful degradation.
+    """
+```
+
+#### PyRosetta Installation
+
+```bash
+conda activate rotamer_dms
+conda install -c https://conda.rosettacommons.org pyrosetta
+# Package size: ~1.41 GB
+```
+
+#### Code Cleanup
+
+Removed dead code from initial implementation:
+- `compute_residue_repulsive_energy()`: Never called, manually iterated atom pairs
+- `compute_wca_for_rotamer_state()`: Never called wrapper
+
+**Justification**: `compute_wca_batch()` is more efficient using PyRosetta's internal neighbor lists.
+
+---
+
+### 2. Conformational Free Energy (ΔG) Computation
+
+#### Background: Rotamer Boltzmann Statistics
+
+The Schrodinger backbone-dependent rotamer library provides **rotamer percentages** (frequencies) derived from statistical analysis of high-resolution protein structures. These percentages approximate the Boltzmann probability distribution of rotamer states.
+
+From statistical mechanics, the probability of a rotamer state is related to its free energy:
+```
+p_i = exp(-G_i / kT) / Z
+```
+
+where Z is the partition function. The **relative free energy change** between two rotamer states is:
+```
+ΔG = G_suggested - G_native = -kT * ln(p_suggested / p_native)
+```
+
+#### Implementation
+
+In `src/rotamer_sampling.py`, within `sample_rotamers_for_residue()`:
+
+```python
+# Identify native rotamer by matching chi angles to library
+native_rotamer_info = find_closest_library_rotamer(struct, chain, resnum)
+p_curr = native_rotamer_info['probability']  # Native rotamer percentage
+
+# For each candidate rotamer:
+percentage = rotamer.percentage()  # Suggested rotamer percentage (p_sugg)
+
+# Compute relative free energy change
+if p_curr > 0 and percentage > 0:
+    delta_g = -math.log(percentage / p_curr)  # In arbitrary units (AU)
+else:
+    delta_g = None
+```
+
+#### Key Implementation Details
+
+1. **Native rotamer identification** (`find_closest_library_rotamer()`):
+   - Measures current chi dihedral angles from structure
+   - Compares to all library rotamers using angular distance
+   - Handles periodicity (angles wrap at ±180°)
+   - Handles symmetric residues (PHE/TYR χ2, ASP χ2, GLU χ3 have 180° equivalence)
+   - Returns closest match with its percentage (p_curr)
+
+2. **Angular distance computation** (`compute_chi_angular_distance()`):
+   - Computes minimum angular difference accounting for periodicity
+   - For symmetric residues, tests both χ and χ+180° and takes minimum
+   - Returns sum of squared angular differences (Euclidean in chi-space)
+
+3. **Units**:
+   - ΔG is in **arbitrary units (AU)**, not kcal/mol or kJ/mol
+   - This is because we use `ln` instead of `log` with explicit kT
+   - AU are dimensionless and internally consistent for ranking
+   - ΔG = 0 when suggested rotamer equals native rotamer
+   - ΔG > 0 means suggested is less favorable than native
+   - ΔG < 0 means suggested is more favorable than native
+
+4. **Edge cases**:
+   - If native rotamer cannot be identified: `p_curr = None`, `delta_g = None`
+   - If rotamer percentage is zero: `delta_g = None`
+   - None values are handled gracefully in joint scoring
+
+#### Justification for This Approach
+
+1. **Statistical basis**: Rotamer frequencies from PDB statistics encode empirical free energy landscape
+2. **No force field needed**: Avoids expensive energy minimization or MD simulation
+3. **Backbone-dependent**: Library accounts for phi/psi-dependent rotamer preferences
+4. **Computationally cheap**: Simple log ratio, no structural calculations required
+5. **Interpretable**: Higher ΔG means less favorable conformational change
+
+---
+
+### 3. Multi-Objective Optimization Scoring
+
+#### Problem Statement
+
+Three metrics with different units/scales:
+- **ΔV (volume)**: Å³, range -50 to +100 → MAXIMIZE
+- **ΔG (free energy)**: arbitrary units, range -3 to +3 → MINIMIZE  
+- **WCA (clash)**: REU, range 0 to 50+ → MINIMIZE
+
+#### Solution: Z-Score Normalization + Weighted Sum
+
+**New File: `src/scoring.py` (~320 lines)**
+
+##### Statistics Computation for Z-Score Normalization
+
+```python
+def compute_stats(values):
+    """
+    Compute mean and standard deviation for z-score normalization.
+    
+    Returns (mean, std) tuple used by compute_joint_score() to
+    normalize each metric inline.
+    
+    Edge cases:
+    - None values skipped
+    - <2 valid values: return (0.0, 1.0)
+    - std=0: use std=1.0 to avoid division by zero
+    """
+```
+
+Z-scores are computed inline in `compute_joint_score()`: `z = (value - mean) / std`
+
+##### Joint Score Computation
+
+```python
+def compute_joint_score(volume_change, delta_g, wca_energy,
+                        w_vol=1.0, w_dg=1.0, w_wca=1.0, ...):
+    """
+    score = w_vol * z(ΔV) - w_dg * z(ΔG) - w_wca * z(WCA)
+    
+    Sign convention:
+    - Positive from volume (want MORE)
+    - Negative from ΔG (want LESS)
+    - Negative from WCA (want LESS)
+    
+    Higher score = better rotamer
+    
+    Hard threshold: If wca_threshold set and WCA > threshold, return None
+    (reject severe clashes regardless of other terms)
+    """
+```
+
+##### Ranking Function
+
+```python
+def rank_rotamers_by_joint_score(rotamer_results, w_vol, w_dg, w_wca, wca_threshold):
+    """
+    Process:
+    1. Compute normalization params (mean, std) for each metric
+    2. Compute joint score for each rotamer
+    3. Sort descending (best first)
+    4. Append rejected rotamers (None score) at end
+    
+    Justification for per-residue normalization:
+    Different residue types have different rotamer distributions;
+    per-residue normalization ensures fair comparison within each residue.
+    """
+```
+
+##### Default Weights
+
+`w_vol=1.0, w_dg=1.0, w_wca=1.0` (equal importance)
+
+**Justification**: With z-score normalization, weights represent relative importance in standard deviations. Equal weights = 1-std improvement in volume is equally valuable as 1-std reduction in WCA.
+
+**Tuning recommendations**:
+- `--w-vol 2.0`: Prioritize volume (accept some clashes)
+- `--w-wca 2.0`: Prioritize clash avoidance (sacrifice volume)
+- `--wca-threshold 10.0`: Hard reject WCA > 10 REU
+
+---
+
+### 4. Pareto Front Analysis
+
+#### What is a Pareto Front?
+
+A rotamer is **Pareto-optimal** if no other rotamer is better in ALL objectives. The **Pareto front** is the set of all non-dominated solutions.
+
+For volume vs. WCA: a rotamer dominates another if it has BOTH higher volume AND lower WCA.
+
+#### Implementation in `src/scoring.py`
+
+```python
+def compute_pareto_front_2d(rotamer_results, maximize_key, minimize_key):
+    """
+    Efficient 2D Pareto computation - O(n log n)
+    
+    Algorithm:
+    1. Sort by maximize_key descending
+    2. Sweep, tracking best minimize_key seen
+    3. Point is Pareto-optimal if minimize_key better than all prior points
+    """
+
+def compute_pareto_front_3d(rotamer_results, maximize_keys, minimize_keys):
+    """
+    3D Pareto computation - O(n²)
+    
+    For each candidate, check if any other solution dominates it.
+    Note: More expensive; for large datasets consider NSGA-II.
+    """
+
+def analyze_pareto_tradeoff(rotamer_results, verbose=True):
+    """
+    Returns:
+    - 2D Pareto front (volume vs. WCA)
+    - 3D Pareto front (volume vs. ΔG vs. WCA)
+    - Extreme points (best volume, lowest WCA)
+    - Best balanced (highest joint score on Pareto front)
+    """
+```
+
+#### Standalone Script: `analyze_pareto.py` (~270 lines)
+
+Post-hoc analysis of checkpoint files:
+
+```bash
+python analyze_pareto.py --checkpoint checkpoints/rotamer_sampling_*.json --output analysis/
+```
+
+**Output files**:
+- `pareto_front.csv`: Pareto-optimal residue mutations
+- `all_best_rotamers.csv`: All residues with Pareto membership flag
+- `pareto_analysis_summary.json`: Summary statistics
+
+---
+
+### 5. Integration into Rotamer Sampling
+
+#### Modified: `src/rotamer_sampling.py`
+
+##### `sample_rotamers_for_residue()`
+
+**New parameters**: `w_vol`, `w_dg`, `w_wca`, `wca_threshold`
+
+**Changes**:
+1. After collecting rotamer results, rank by joint score (not volume only)
+2. Compute and include Pareto front analysis
+3. Return joint scores and Pareto data
+
+**New return fields**:
+- `joint_scores`: List of joint optimization scores
+- `best_joint_score`: Score of selected best rotamer
+- `best_by_volume_idx`: Best by volume only (for comparison)
+- `pareto_front`: Pareto-optimal rotamer results
+- `pareto_analysis`: Full analysis dictionary
+
+##### `run_rotamer_sampling_phase()`
+
+**New parameters**: `w_vol`, `w_dg`, `w_wca`, `wca_threshold`
+
+Passes weight parameters through to `sample_rotamers_for_residue()`.
+
+##### `save_rotamer_checkpoint()`
+
+**New fields in checkpoint**:
+- `best_joint_score`
+- `best_by_volume_idx`
+- `pareto_front_indices`
+- `num_pareto_optimal`
+
+**Removed**: `wca_sorted_indices`, `wca_sorted_energies` (replaced by joint scoring)
+
+---
+
+### 6. CLI Updates
+
+#### Modified: `run_rotamer_dms.py`
+
+**New arguments**:
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--w-vol` | float | 1.0 | Weight for volume term |
+| `--w-dg` | float | 1.0 | Weight for deltaG term |
+| `--w-wca` | float | 1.0 | Weight for WCA term |
+| `--wca-threshold` | float | None | Hard WCA threshold (REU) |
+
+Startup banner displays weights when WCA is enabled.
+
+---
+
+### 7. Updated Project Structure
+
+```
+RotamerDMS/
+├── src/
+│   ├── __init__.py
+│   ├── preparation.py
+│   ├── cavity.py
+│   ├── mutation.py
+│   ├── rotamer_sampling.py    # Modified: joint scoring integration
+│   ├── wca_potential.py       # NEW: WCA via PyRosetta
+│   └── scoring.py             # NEW: Multi-objective scoring & Pareto
+├── run_rotamer_dms.py         # Modified: weight CLI args
+├── analyze_pareto.py          # NEW: Standalone Pareto analysis
+└── ...
+```
+
+---
+
+### 8. Usage Examples
+
+#### Basic (equal weights)
+```bash
+$SCHRODINGER/run python3 run_rotamer_dms.py \
+    --reference data/ref.pdb --sample data/sample.pdb --ligand LIG
+```
+
+#### Prioritize Volume
+```bash
+$SCHRODINGER/run python3 run_rotamer_dms.py \
+    --reference data/ref.pdb --sample data/sample.pdb --ligand LIG \
+    --w-vol 2.0 --w-wca 0.5
+```
+
+#### Strict Clash Rejection
+```bash
+$SCHRODINGER/run python3 run_rotamer_dms.py \
+    --reference data/ref.pdb --sample data/sample.pdb --ligand LIG \
+    --wca-threshold 10.0
+```
+
+#### Disable WCA (faster, volume-only)
+```bash
+$SCHRODINGER/run python3 run_rotamer_dms.py \
+    --reference data/ref.pdb --sample data/sample.pdb --ligand LIG \
+    --no-wca
+```
+
+#### Analyze Pareto Front
+```bash
+python analyze_pareto.py \
+    --checkpoint checkpoints/rotamer_sampling_*.json \
+    --output analysis/
+```
+
+---
+
+### 9. Changelog Update
+
+- **v0.2** (March 19, 2026): WCA potential and multi-objective optimization
+  - PyRosetta integration for WCA/fa_rep energy computation
+  - Z-score normalized joint scoring (volume, deltaG, WCA)
+  - Pareto front analysis for tradeoff visualization
+  - CLI arguments for weight tuning and WCA threshold
+  - Standalone Pareto analysis script
+
+---
+
+## Session: March 20, 2026 - SLURM Integration & Per-Residue Pareto Analysis
+
+### Overview
+
+Three major improvements:
+1. **SLURM integration** for cluster job submission
+2. **PyRosetta subprocess fixes** (timeout, error logging)
+3. **Per-residue 3D Pareto analysis** in checkpoints and analyze_pareto.py
+
+---
+
+### 1. SLURM Integration
+
+#### Problem
+Running RotamerDMS interactively on login nodes is inappropriate for compute-intensive PyRosetta operations.
+
+#### Solution
+Added SBATCH directives to `run_rotamer_dms.sh` for seamless SLURM submission:
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=rot_dms
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --time=01:00:00
+#SBATCH --mem=16GB
+#SBATCH --partition=lyu_a
+#SBATCH --account=lyu_condo_bank
+#SBATCH --output=rot_dms_%j.out
+#SBATCH --error=rot_dms_%j.err
+```
+
+#### Key Fix: Working Directory Resolution
+
+**Problem**: When SLURM runs a job, it copies the script to `/var/spool/slurmd/job<id>/` and executes from there. The original `SCRIPT_DIR` detection via `${BASH_SOURCE[0]}` pointed to this temp location, causing "file not found" errors.
+
+**Solution**: Use `SLURM_SUBMIT_DIR` environment variable (set by SLURM to the directory where `sbatch` was called):
+
+```bash
+# Get the working directory
+# When running under SLURM, use SLURM_SUBMIT_DIR (where sbatch was called)
+# When running interactively, use the script's location
+if [ -n "$SLURM_SUBMIT_DIR" ]; then
+    SCRIPT_DIR="$SLURM_SUBMIT_DIR"
+else
+    SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+fi
+```
+
+#### Usage
+
+**Interactive** (unchanged):
+```bash
+./run_rotamer_dms.sh --reference data/ref.pdb --sample data/sample.pdb --ligand LIG
+```
+
+**SLURM submission**:
+```bash
+sbatch run_rotamer_dms.sh --reference data/ref.pdb --sample data/sample.pdb --ligand LIG
+```
+
+Command-line arguments pass through transparently via `$@`.
+
+#### Resource Recommendations
+
+| Resource | Value | Justification |
+|----------|-------|---------------|
+| CPUs | 4 | pyKVFinder can use OpenMP; main code is serial |
+| Memory | 16GB | PyRosetta initialization needs headroom |
+| Time | 1 hour | Sufficient for ~10 residues; increase for larger runs |
+
+---
+
+### 2. PyRosetta Subprocess Fixes
+
+#### Problem 1: Silent WCA Failures
+
+WCA computation failures were silently swallowed when `verbose=False`, making debugging impossible.
+
+**Fix**: Always log errors to stderr (appears in SLURM `.err` file):
+
+```python
+# In src/wca_potential.py, get_wca_energy()
+else:
+    # Always log errors to stderr so they appear in SLURM error files
+    import sys
+    error_msg = result.get('error', 'unknown error')
+    print(f"WCA computation failed for {chain}:{resnum}: {error_msg}", file=sys.stderr)
+    return None
+```
+
+#### Problem 2: Timeout on First PyRosetta Call
+
+The first PyRosetta subprocess call timed out (60s) because:
+1. Python interpreter startup
+2. `import pyrosetta` (~10-20s)
+3. `pyrosetta.init()` (~5-15s)
+4. PDB loading and scoring
+
+On busy cluster nodes, this exceeded 60 seconds.
+
+**Fix**: Increased timeout from 60s to 120s:
+
+```python
+# In src/wca_potential.py, run_pyrosetta_subprocess()
+result = subprocess.run(
+    [CONDA_PYTHON, PYROSETTA_RUNNER],
+    input=json.dumps(input_data),
+    capture_output=True,
+    text=True,
+    timeout=120,  # Increased from 60
+    env=env,
+)
+```
+
+---
+
+### 3. Per-Residue 3D Pareto Analysis
+
+#### Problem
+
+The original `analyze_pareto.py` computed Pareto fronts across residues (comparing 3 best rotamers), which is not useful. The real value is computing Pareto fronts **within each residue** across all rotamer states.
+
+#### Solution
+
+##### Modified: `src/rotamer_sampling.py` - Checkpoint Format
+
+Now stores **all rotamer data** (not just best) in checkpoint:
+
+```python
+# In save_rotamer_checkpoint()
+all_rotamers = []
+for i, rot_idx in enumerate(res_data['rotamer_states']):
+    all_rotamers.append({
+        'index': rot_idx,
+        'volume_change': res_data['volume_changes'][i],
+        'percentage': res_data['percentages'][i],
+        'delta_g': res_data['delta_g_values'][i],
+        'wca_energy': res_data['wca_energies'][i],
+        'joint_score': res_data['joint_scores'][i]
+    })
+
+checkpoint_data['residue_details'].append({
+    # ... existing fields ...
+    'all_rotamers': all_rotamers  # NEW: full rotamer data
+})
+```
+
+##### Modified: `analyze_pareto.py` - 3D Pareto Analysis
+
+New function `analyze_per_residue_pareto()`:
+
+```python
+def analyze_per_residue_pareto(residue_rotamers, verbose=True):
+    """
+    Compute 3D Pareto fronts (volume ↑, deltaG ↓, WCA ↓) for each residue.
+    
+    For each residue:
+    1. Filter rotamers with valid data for all 3 metrics
+    2. Compute 3D Pareto front using compute_pareto_front_3d()
+    3. Sort Pareto front by volume (descending)
+    4. Return per-residue analysis results
+    """
+```
+
+**Output format**:
+
+```
+PER-RESIDUE 3D PARETO ANALYSIS (Volume ↑, ΔG ↓, WCA ↓)
+============================================================
+
+A:MET102: 5 Pareto-optimal rotamers out of 26
+  Idx   ΔVolume        ΔG         WCA     Score
+  ------------------------------------------------
+  11    +119.66      0.76      658.32     1.234
+  7      +87.70      0.02      216.29     1.873
+  1     +102.17     -0.97      282.62     2.928
+  ...
+```
+
+##### New Export Files
+
+| File | Description |
+|------|-------------|
+| `pareto_fronts_per_residue.csv` | All rotamers with `on_pareto_front` flag |
+| `residue_summaries.csv` | Best rotamer per residue summary |
+| `pareto_analysis_summary.json` | Full JSON with per-residue Pareto data |
+
+##### Backward Compatibility
+
+Checkpoints without `all_rotamers` field (old format) are detected:
+```python
+has_full_data = len(residue_rotamers) > 0
+
+if not has_full_data:
+    print("Note: Checkpoint uses old format (best rotamer only).")
+    print("Re-run rotamer sampling to get full Pareto analysis.")
+```
+
+---
+
+### 4. Updated Project Structure
+
+```
+RotamerDMS/
+├── src/
+│   ├── wca_potential.py       # Modified: stderr logging, 120s timeout
+│   ├── rotamer_sampling.py    # Modified: all_rotamers in checkpoint
+│   └── scoring.py             # Unchanged
+├── run_rotamer_dms.sh         # Modified: SBATCH directives, SLURM_SUBMIT_DIR
+├── analyze_pareto.py          # Modified: per-residue 3D Pareto analysis
+└── claude.md                  # This file
+```
+
+---
+
+### 5. Changelog Update
+
+- **v0.3** (March 20, 2026): SLURM integration and enhanced Pareto analysis
+  - SBATCH directives for cluster job submission
+  - Fixed working directory resolution for SLURM (`SLURM_SUBMIT_DIR`)
+  - Increased PyRosetta subprocess timeout (60s → 120s)
+  - Added stderr logging for WCA computation failures
+  - Enhanced checkpoint format with all rotamer data
+  - Per-residue 3D Pareto front analysis in `analyze_pareto.py`
+  - New export files: `pareto_fronts_per_residue.csv`, `residue_summaries.csv`
+
+---
+
+## Session: March 24, 2026 - Energy Minimization for Realistic Structures
+
+### Overview
+
+Added local energy minimization step to produce physically realistic structures with low steric clash energies. Previously, fa_rep energies were ~100+ REU; after minimization, they should be in the realistic 5-20 REU range.
+
+---
+
+### 1. Problem Statement
+
+**Issue**: Raw rotamer state transitions often produce high fa_rep (steric repulsion) energies (~100-900 REU) because surrounding residues haven't had a chance to adjust to the new rotamer conformation.
+
+**Solution**: After applying each rotamer state, perform local energy minimization with PyRosetta's `MinMover` using the `ref2015` score function. The target residue is **frozen** during minimization (using `MoveMap`) so the rotamer conformation is preserved while surrounding residues relax.
+
+---
+
+### 2. PyRosetta Components Used
+
+#### ref2015 Score Function
+
+The `ref2015` score function is Rosetta's default full-atom energy function, containing:
+- `fa_rep`: Lennard-Jones repulsive (weight 0.55)
+- `fa_atr`: Lennard-Jones attractive (weight 1.0)
+- `fa_sol`: Lazaridis-Karplus solvation
+- `fa_elec`: Coulombic electrostatics
+- `hbond_*`: Hydrogen bonding terms
+- `rama_prepro`: Ramachandran preferences
+- `fa_dun`: Dunbrack rotamer energy
+- Plus ~10 more terms
+
+#### MinMover
+
+Gradient-based local minimizer that finds the nearest energy minimum:
+
+```python
+from pyrosetta.rosetta.protocols.minimization_packing import MinMover
+
+minmover = MinMover()
+minmover.movemap(movemap)           # Define degrees of freedom
+minmover.score_function(sfxn)       # ref2015
+minmover.min_type('lbfgs_armijo_nonmonotone')  # Minimizer algorithm
+minmover.tolerance(0.01)            # Convergence criterion
+minmover.max_iter(200)              # Max iterations
+minmover.apply(pose)                # Run minimization
+```
+
+#### MoveMap
+
+Controls which degrees of freedom are allowed to change:
+
+```python
+from pyrosetta.rosetta.core.kinematics import MoveMap
+
+movemap = MoveMap()
+movemap.set_bb(True)                # Allow backbone torsions
+movemap.set_chi(True)               # Allow chi torsions
+
+# Freeze target residue (preserve rotamer)
+movemap.set_bb(target_pose_resnum, False)
+movemap.set_chi(target_pose_resnum, False)
+```
+
+**Key Insight**: By setting `bb=False` and `chi=False` for the target residue, we ensure that:
+1. The rotamer conformation is preserved exactly
+2. Surrounding residues can adjust to relieve clashes
+3. The resulting structure is physically realistic
+
+---
+
+### 3. Modified Workflow
+
+**Before (v0.2)**:
+```
+Apply rotamer → Compute volume → Compute fa_rep (no minimization)
+```
+
+**After (v0.4)**:
+```
+Apply rotamer → Compute ΔG → Minimize (frozen target) → Compute volume → Extract fa_rep
+```
+
+**Rationale**:
+- **ΔG computed before minimization**: Represents the conformational free energy change based on statistical rotamer frequencies, independent of structural relaxation
+- **Volume computed after minimization**: Captures the realistic pocket volume after surrounding residues have adjusted
+- **fa_rep extracted after minimization**: Reflects true steric strain in the relaxed structure
+
+---
+
+### 4. Code Changes
+
+#### `src/pyrosetta_runner.py` - Complete Rewrite
+
+**Old function**: `compute_wca_energy()` - just scored structure with fa_rep
+
+**New function**: `minimize_with_frozen_residue()`:
+1. Load PDB into PyRosetta Pose
+2. Find target residue in pose numbering
+3. Create ref2015 score function
+4. Create MoveMap with target residue frozen
+5. Create MinMover and apply to pose
+6. Extract fa_rep energy for target residue
+7. Return minimized PDB content + fa_rep energy
+
+```python
+def minimize_with_frozen_residue(pdb_file, chain, resnum, verbose=False):
+    pose = pyrosetta.pose_from_pdb(pdb_file)
+    target_pose_resnum = find_pose_resnum(pose, chain, resnum)
+    
+    sfxn = pyrosetta.create_score_function('ref2015')
+    
+    movemap = MoveMap()
+    movemap.set_bb(True)
+    movemap.set_chi(True)
+    movemap.set_bb(target_pose_resnum, False)   # Freeze target
+    movemap.set_chi(target_pose_resnum, False)  # Freeze target
+    
+    minmover = MinMover()
+    minmover.movemap(movemap)
+    minmover.score_function(sfxn)
+    minmover.min_type('lbfgs_armijo_nonmonotone')
+    minmover.tolerance(0.01)
+    minmover.max_iter(200)
+    
+    minmover.apply(pose)
+    
+    # Extract fa_rep for target residue
+    energies = pose.energies()
+    fa_rep_energy = energies.residue_total_energies(target_pose_resnum)[ScoreType.fa_rep]
+    
+    # Return minimized PDB content
+    pose.dump_pdb(temp_path)
+    return {'success': True, 'fa_rep_energy': fa_rep_energy, 'minimized_pdb': ...}
+```
+
+#### `src/wca_potential.py` - Renamed and Updated
+
+**Module renamed conceptually**: From "WCA potential computation" to "Energy minimization and fa_rep extraction"
+
+**Old function**: `get_wca_energy()` → returns float
+
+**New function**: `minimize_and_get_fa_rep()` → returns dict with:
+- `fa_rep_energy`: float
+- `minimized_struct`: Schrodinger Structure object
+- `total_score`: float (ref2015 total)
+
+**Key addition**: `_load_structure_from_pdb_content()` to convert PyRosetta output back to Schrodinger Structure
+
+**Timeout increased**: 120s → 300s (minimization takes longer than simple scoring)
+
+#### `src/rotamer_sampling.py` - Workflow Update
+
+**Import change**:
+```python
+# Old
+from .wca_potential import get_wca_energy, _check_pyrosetta_available
+
+# New
+from .wca_potential import minimize_and_get_fa_rep, _check_pyrosetta_available
+```
+
+**Logic change in `sample_rotamers_for_residue()`**:
+
+```python
+# Apply rotamer
+test_rotamers[rot_idx].apply()
+
+# Compute ΔG BEFORE minimization (from rotamer statistics)
+delta_g = -math.log(percentage / p_curr)
+
+# Minimize and get fa_rep
+fa_rep_energy = None
+struct_for_volume = test_struct  # Default: non-minimized
+
+if compute_wca:
+    min_result = minimize_and_get_fa_rep(test_struct, chain, resnum)
+    if min_result.get('success'):
+        fa_rep_energy = min_result['fa_rep_energy']
+        struct_for_volume = min_result['minimized_struct']
+
+# Compute volume on MINIMIZED structure
+result = measure_binding_site_volume(struct_for_volume, ...)
+delta_volume = result['total_volume'] - initial_volume
+```
+
+---
+
+### 5. Expected Impact
+
+| Metric | Before Minimization | After Minimization |
+|--------|--------------------|--------------------|
+| fa_rep energy | 100-900 REU | 5-20 REU |
+| Structure quality | Unrealistic clashes | Physically plausible |
+| Volume measurement | Raw rotamer volume | Relaxed pocket volume |
+| Runtime per rotamer | ~1-2 sec | ~5-15 sec |
+
+**Trade-off**: Minimization adds computational cost (~5-10x slower per rotamer) but produces much more realistic structures with interpretable fa_rep energies.
+
+---
+
+### 6. Changelog Update
+
+- **v0.4** (March 24, 2026): Energy minimization for realistic structures
+  - Added PyRosetta MinMover-based local minimization after each rotamer transition
+  - Target residue frozen during minimization to preserve rotamer state
+  - Uses ref2015 score function for comprehensive energy evaluation
+  - fa_rep energy now reflects relaxed structure (realistic 5-20 REU range)
+  - Volume computed on minimized structure for accurate pocket measurement
+  - Subprocess timeout increased to 300s for minimization
+  - Removed redundant explicit WCA computation code

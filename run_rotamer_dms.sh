@@ -1,11 +1,25 @@
 #!/bin/bash
-#
+#SBATCH --job-name=rot_dms
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --time=01:00:00
+#SBATCH --mem=16GB
+#SBATCH --partition=lyu_a
+#SBATCH --account=lyu_condo_bank
+#SBATCH --output=rot_dms_%j.out
+#SBATCH --error=rot_dms_%j.err
+
 # RotamerDMS Runner Script
 # 
 # This script sets up the required environment and runs the RotamerDMS algorithm.
+# Can be run interactively or submitted to SLURM.
 #
-# Usage:
+# Usage (interactive):
 #   ./run_rotamer_dms.sh --reference <ref.pdb> --sample <sample.pdb> --ligand <code> [options]
+#
+# Usage (SLURM):
+#   sbatch run_rotamer_dms.sh --reference <ref.pdb> --sample <sample.pdb> --ligand <code> [options]
 #
 # Options:
 #   --reference, -r    Path to experimental reference structure with bound ligand
@@ -17,13 +31,24 @@
 #   --output-dir, -o   Output directory (default: ./output)
 #   --checkpoint-dir   Checkpoint directory (default: ./checkpoints)
 #   --quiet, -q        Reduce output verbosity
+#   --no-wca           Disable WCA (steric clash) potential computation
+#   --w-vol            Weight for volume term in joint optimization (default: 1.0)
+#   --w-dg             Weight for deltaG term in joint optimization (default: 1.0)
+#   --w-wca            Weight for WCA clash term in joint optimization (default: 1.0)
+#   --wca-threshold    Hard WCA threshold (REU) to reject clashing rotamers
 #   --help, -h         Show this help message
 #
 
 set -e
 
-# Get the directory where this script is located
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+# Get the working directory
+# When running under SLURM, use SLURM_SUBMIT_DIR (where sbatch was called)
+# When running interactively, use the script's location
+if [ -n "$SLURM_SUBMIT_DIR" ]; then
+    SCRIPT_DIR="$SLURM_SUBMIT_DIR"
+else
+    SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+fi
 
 # Show help if no arguments
 if [ $# -eq 0 ]; then
@@ -43,6 +68,14 @@ if [ $# -eq 0 ]; then
     echo "  --output-dir, -o   Output directory (default: ./output)"
     echo "  --checkpoint-dir   Checkpoint directory (default: ./checkpoints)"
     echo "  --quiet, -q        Reduce output verbosity"
+    echo ""
+    echo "WCA/Joint optimization arguments:"
+    echo "  --no-wca           Disable WCA (steric clash) potential computation"
+    echo "  --w-vol            Weight for volume term in joint optimization (default: 1.0)"
+    echo "  --w-dg             Weight for deltaG term in joint optimization (default: 1.0)"
+    echo "  --w-wca            Weight for WCA clash term in joint optimization (default: 1.0)"
+    echo "  --wca-threshold    Hard WCA threshold (REU) to reject clashing rotamers"
+    echo ""
     echo "  --help, -h         Show this help message"
     echo ""
     echo "Example:"
@@ -69,6 +102,14 @@ for arg in "$@"; do
         echo "  --output-dir, -o   Output directory (default: ./output)"
         echo "  --checkpoint-dir   Checkpoint directory (default: ./checkpoints)"
         echo "  --quiet, -q        Reduce output verbosity"
+        echo ""
+        echo "WCA/Joint optimization arguments:"
+        echo "  --no-wca           Disable WCA (steric clash) potential computation"
+        echo "  --w-vol            Weight for volume term in joint optimization (default: 1.0)"
+        echo "  --w-dg             Weight for deltaG term in joint optimization (default: 1.0)"
+        echo "  --w-wca            Weight for WCA clash term in joint optimization (default: 1.0)"
+        echo "  --wca-threshold    Hard WCA threshold (REU) to reject clashing rotamers"
+        echo ""
         echo "  --help, -h         Show this help message"
         echo ""
         echo "Example:"

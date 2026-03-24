@@ -117,6 +117,41 @@ Examples:
         help='Reduce output verbosity'
     )
     
+    parser.add_argument(
+        '--no-wca',
+        action='store_true',
+        help='Disable WCA (steric clash) potential computation'
+    )
+    
+    # Joint optimization weight parameters
+    parser.add_argument(
+        '--w-vol',
+        type=float,
+        default=1.0,
+        help='Weight for volume term in joint optimization (default: 1.0)'
+    )
+    
+    parser.add_argument(
+        '--w-dg',
+        type=float,
+        default=1.0,
+        help='Weight for deltaG term in joint optimization (default: 1.0)'
+    )
+    
+    parser.add_argument(
+        '--w-wca',
+        type=float,
+        default=1.0,
+        help='Weight for WCA clash term in joint optimization (default: 1.0)'
+    )
+    
+    parser.add_argument(
+        '--wca-threshold',
+        type=float,
+        default=None,
+        help='Hard WCA threshold (REU) to reject clashing rotamers (default: None)'
+    )
+    
     return parser.parse_args()
 
 
@@ -144,6 +179,11 @@ def main():
     print(f"Distance threshold: {args.distance} Å")
     print(f"Top residue percentage: {args.top_percent}%")
     print(f"Min cavity contacts: {args.min_contacts}")
+    print(f"WCA potential computation: {'disabled' if args.no_wca else 'enabled'}")
+    if not args.no_wca:
+        print(f"Joint optimization weights: vol={args.w_vol}, dG={args.w_dg}, WCA={args.w_wca}")
+        if args.wca_threshold:
+            print(f"WCA hard threshold: {args.wca_threshold} REU")
     print(f"Output directory: {output_dir}")
     print(f"Checkpoint directory: {checkpoint_dir}")
     print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -258,6 +298,11 @@ def main():
         mapped_residues,
         initial_volume,
         min_contacts=args.min_contacts,
+        compute_wca=not args.no_wca,
+        w_vol=args.w_vol,
+        w_dg=args.w_dg,
+        w_wca=args.w_wca,
+        wca_threshold=args.wca_threshold,
         checkpoint_dir=checkpoint_dir,
         verbose=verbose
     )
