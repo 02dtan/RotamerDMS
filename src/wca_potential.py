@@ -93,8 +93,152 @@ def _save_structure_temp(schrodinger_struct):
     return temp_path
 
 
+def _parse_pdb_coordinates(pdb_content):
+    """
+    Parse atom coordinates from PDB content.
+    
+    Returns a dictionary mapping (chain, resnum, atom_name) -> (x, y, z)
+    Only parses ATOM/HETATM records for heavy atoms (hydrogens already stripped).
+    """
+    coords = {}
+    for line in pdb_content.split('\n'):
+        if not line.startswith(('ATOM', 'HETATM')):
+            continue
+        
+        # PDB format columns (0-indexed):
+        # 12-15: atom name
+        # 17-19: residue name
+        # 21: chain ID
+        # 22-25: residue sequence number
+        # 30-37: x coordinate
+        # 38-45: y coordinate
+        # 46-53: z coordinate
+        try:
+            atom_name = line[12:16].strip()
+            chain = line[21:22].strip()
+            resnum = int(line[22:26].strip())
+            x = float(line[30:38].strip())
+            y = float(line[38:46].strip())
+            z = float(line[46:54].strip())
+            
+            # Use (chain, resnum, atom_name) as key
+            # If chain is empty, use ' ' as placeholder
+            if not chain:
+                chain = ' '
+            coords[(chain, resnum, atom_name)] = (x, y, z)
+        except (ValueError, IndexError):
+            continue
+    
+    return coords
+
+
+def _transfer_coordinates(original_struct, minimized_pdb_content, verbose=False):
+    """
+    Transfer coordinates from minimized PDB back to original Schrodinger structure.
+    
+    This preserves the original structure's connectivity, atom properties, and
+    residue identifiers while updating only the XYZ coordinates.
+    
+    Args:
+        original_struct: Original Schrodinger Structure object
+        minimized_pdb_content: PDB content string from PyRosetta minimization
+        verbose: Print debug information
+        
+    Returns:
+        Dictionary with:
+            - success: bool
+            - structure: Updated Schrodinger Structure (copy of original with new coords)
+            - atoms_updated: Number of atoms that had coordinates updated
+            - atoms_total: Total number of heavy atoms in original structure
+            - atoms_missing: List of atoms not found in minimized PDB
+            - rmsd: RMSD between original and updated coordinates
+            - error: str (if failed)
+    """
+    import math
+    
+    # Parse coordinates from minimized PDB
+    minimized_coords = _parse_pdb_coordinates(minimized_pdb_content)
+    
+    if not minimized_coords:
+        return {
+            'success': False,
+            'error': 'No coordinates found in minimized PDB'
+        }
+    
+    # Make a copy of the original structure to modify
+    updated_struct = original_struct.copy()
+    
+    atoms_updated = 0
+    atoms_missing = []
+    sum_sq_dist = 0.0
+    
+    for atom in updated_struct.atom:
+        # Skip hydrogens (we only care about heavy atoms)
+        if atom.atomic_number == 1:
+            continue
+        
+        # Get atom identifiers
+        chain = atom.chain.strip() if atom.chain else ' '
+        resnum = atom.resnum
+        atom_name = atom.pdbname.strip()
+        
+        # Look up coordinates in minimized structure
+        key = (chain, resnum, atom_name)
+        
+        if key in minimized_coords:
+            new_x, new_y, new_z = minimized_coords[key]
+            
+            # Calculate squared distance for RMSD
+            dx = new_x - atom.x
+            dy = new_y - atom.y
+            dz = new_z - atom.z
+            sum_sq_dist += dx*dx + dy*dy + dz*dz
+            
+            # Update coordinates
+            atom.x = new_x
+            atom.y = new_y
+            atom.z = new_z
+            atoms_updated += 1
+        else:
+            atoms_missing.append(f"{chain}:{resnum}:{atom_name}")
+    
+    # Count total heavy atoms
+    atoms_total = sum(1 for a in original_struct.atom if a.atomic_number != 1)
+    
+    # Calculate RMSD
+    rmsd = math.sqrt(sum_sq_dist / atoms_updated) if atoms_updated > 0 else 0.0
+    
+    if verbose:
+        print(f"    Coordinate transfer: {atoms_updated}/{atoms_total} atoms updated, RMSD={rmsd:.3f} Å")
+        if atoms_missing:
+            print(f"    Warning: {len(atoms_missing)} atoms not found in minimized structure")
+    
+    # Validation: check that we updated most atoms
+    update_ratio = atoms_updated / atoms_total if atoms_total > 0 else 0
+    if update_ratio < 0.9:
+        return {
+            'success': False,
+            'error': f'Only {atoms_updated}/{atoms_total} atoms ({update_ratio:.1%}) could be mapped. '
+                     f'Missing atoms: {atoms_missing[:10]}...'
+        }
+    
+    return {
+        'success': True,
+        'structure': updated_struct,
+        'atoms_updated': atoms_updated,
+        'atoms_total': atoms_total,
+        'atoms_missing': atoms_missing,
+        'rmsd': rmsd,
+    }
+
+
 def _load_structure_from_pdb_content(pdb_content):
-    """Load a Schrodinger Structure from PDB content string."""
+    """
+    DEPRECATED: Load a Schrodinger Structure from PDB content string.
+    
+    This function is kept for backwards compatibility but should not be used.
+    Use _transfer_coordinates() instead to preserve structure consistency.
+    """
     from schrodinger import structure as schrod_structure
     
     with tempfile.NamedTemporaryFile(suffix='.pdb', delete=False, mode='w') as f:
@@ -214,14 +358,21 @@ def minimize_and_get_fa_rep(schrodinger_struct, chain, resnum, verbose=False):
                   file=sys.stderr)
             return result
         
-        # Convert minimized PDB content back to Schrodinger Structure
-        minimized_struct = _load_structure_from_pdb_content(result['minimized_pdb'])
+        # Transfer coordinates from minimized PDB back to original structure
+        # This preserves connectivity, atom properties, and residue identifiers
+        transfer_result = _transfer_coordinates(
+            schrodinger_struct, 
+            result['minimized_pdb'],
+            verbose=verbose
+        )
         
-        if minimized_struct is None:
+        if not transfer_result.get('success'):
             return {
                 'success': False,
-                'error': 'Failed to load minimized structure'
+                'error': f"Coordinate transfer failed: {transfer_result.get('error', 'unknown')}"
             }
+        
+        minimized_struct = transfer_result['structure']
         
         if verbose:
             print(f"    Minimized {chain}:{resnum}: fa_rep={result['fa_rep_energy']:.2f} REU, "
@@ -235,6 +386,9 @@ def minimize_and_get_fa_rep(schrodinger_struct, chain, resnum, verbose=False):
             'minimized_struct': minimized_struct,
             'total_score': result['total_score'],
             'score_before': result.get('score_before'),
+            'coord_transfer_rmsd': transfer_result['rmsd'],
+            'atoms_updated': transfer_result['atoms_updated'],
+            'atoms_total': transfer_result['atoms_total'],
         }
         
     finally:
@@ -265,3 +419,125 @@ def get_fa_rep_energy(schrodinger_struct, chain, resnum, verbose=False):
         return result['fa_rep_energy']
     else:
         return None
+
+
+def run_full_minimization_subprocess(pdb_file, verbose=False):
+    """
+    Run full structure minimization in PyRosetta subprocess (no frozen residues).
+    
+    Args:
+        pdb_file: Path to PDB file
+        verbose: Print details
+        
+    Returns:
+        Dictionary with:
+            - success: bool
+            - total_fa_rep: float - total fa_rep energy
+            - total_score: float - total ref2015 score
+            - minimized_pdb: str - PDB content of minimized structure
+            - error: str (if failed)
+    """
+    if not _check_pyrosetta_available():
+        return {'success': False, 'error': 'PyRosetta not available'}
+    
+    input_data = {
+        'pdb_file': pdb_file,
+        'mode': 'full',
+        'verbose': verbose,
+    }
+    
+    env = os.environ.copy()
+    env.pop('PYTHONPATH', None)
+    env.pop('PYTHONHOME', None)
+    
+    try:
+        result = subprocess.run(
+            [CONDA_PYTHON, PYROSETTA_RUNNER],
+            input=json.dumps(input_data),
+            capture_output=True,
+            text=True,
+            timeout=600,  # 10 minute timeout for full structure
+            env=env,
+        )
+        
+        if result.returncode != 0:
+            error_msg = result.stderr or result.stdout or "Unknown error"
+            return {'success': False, 'error': f'Subprocess failed: {error_msg}'}
+        
+        output = json.loads(result.stdout)
+        return output
+        
+    except subprocess.TimeoutExpired:
+        return {'success': False, 'error': 'PyRosetta minimization timed out (>600s)'}
+    except json.JSONDecodeError as e:
+        return {'success': False, 'error': f'Failed to parse PyRosetta output: {e}'}
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
+
+def minimize_full_structure(schrodinger_struct, verbose=False):
+    """
+    Minimize entire structure with PyRosetta (no frozen residues).
+    
+    Used for final minimization after all rotamer changes have been applied.
+    
+    Args:
+        schrodinger_struct: Schrodinger Structure object
+        verbose: Print progress
+        
+    Returns:
+        Dictionary with:
+            - success: bool
+            - total_fa_rep: float - total fa_rep energy
+            - minimized_struct: Schrodinger Structure - minimized structure
+            - total_score: float - total ref2015 score
+            - error: str (if failed)
+    """
+    # Save structure to temp PDB
+    temp_pdb = _save_structure_temp(schrodinger_struct)
+    
+    try:
+        result = run_full_minimization_subprocess(temp_pdb, verbose)
+        
+        if not result.get('success'):
+            print(f"Full minimization failed: {result.get('error', 'unknown')}", 
+                  file=sys.stderr)
+            return result
+        
+        # Transfer coordinates from minimized PDB back to original structure
+        # This preserves connectivity, atom properties, and residue identifiers
+        transfer_result = _transfer_coordinates(
+            schrodinger_struct, 
+            result['minimized_pdb'],
+            verbose=verbose
+        )
+        
+        if not transfer_result.get('success'):
+            return {
+                'success': False,
+                'error': f"Coordinate transfer failed: {transfer_result.get('error', 'unknown')}"
+            }
+        
+        minimized_struct = transfer_result['structure']
+        
+        if verbose:
+            print(f"    Full minimization complete: fa_rep={result['total_fa_rep']:.2f} REU "
+                  f"(score: {result.get('score_before', 0):.1f} → {result['total_score']:.1f})")
+            print(f"    Coordinate transfer: RMSD={transfer_result['rmsd']:.3f} Å, "
+                  f"{transfer_result['atoms_updated']}/{transfer_result['atoms_total']} atoms")
+        
+        return {
+            'success': True,
+            'total_fa_rep': result['total_fa_rep'],
+            'minimized_struct': minimized_struct,
+            'total_score': result['total_score'],
+            'score_before': result.get('score_before'),
+            'coord_transfer_rmsd': transfer_result['rmsd'],
+            'atoms_updated': transfer_result['atoms_updated'],
+            'atoms_total': transfer_result['atoms_total'],
+        }
+        
+    finally:
+        # Clean up temp file
+        if os.path.exists(temp_pdb):
+            os.remove(temp_pdb)

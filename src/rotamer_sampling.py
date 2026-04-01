@@ -16,7 +16,7 @@ from schrodinger.protein import rotamers
 from schrodinger.structutils.measure import measure_dihedral_angle
 
 from .cavity import measure_binding_site_volume
-from .wca_potential import minimize_and_get_fa_rep, _check_pyrosetta_available
+from .wca_potential import minimize_and_get_fa_rep, minimize_full_structure, _check_pyrosetta_available
 from .scoring import (
     rank_rotamers_by_joint_score,
     analyze_pareto_tradeoff,
@@ -349,7 +349,8 @@ def sample_rotamers_for_residue(struct, chain, resnum, resname, binding_site_res
         
         # Minimize structure and get fa_rep energy
         # The minimization relaxes surrounding residues while keeping the target
-        # rotamer frozen, producing more physically realistic structures
+        # rotamer frozen. We extract fa_rep/fa_dun energies and use the minimized
+        # structure for volume computation to get physically realistic values.
         fa_rep_energy = None
         fa_dun_energy = None
         struct_for_volume = test_struct  # Default: use non-minimized structure
@@ -360,9 +361,9 @@ def sample_rotamers_for_residue(struct, chain, resnum, resname, binding_site_res
                 fa_rep_energy = min_result['fa_rep_energy']
                 fa_dun_energy = min_result.get('fa_dun_energy')
                 struct_for_volume = min_result['minimized_struct']
-            # If minimization fails, we still proceed with non-minimized structure
+            # If minimization fails, fall back to non-minimized structure
         
-        # Measure volume on the (possibly minimized) structure
+        # Measure volume on the minimized structure (or original if minimization failed)
         result = measure_binding_site_volume(
             struct_for_volume, 
             binding_site_residues,
@@ -568,27 +569,67 @@ def run_rotamer_sampling_phase(sample_struct, sorted_residues, binding_site_resi
                     if verbose:
                         print(f"  Warning: Failed to apply best rotamer: {e}")
     
+    # Final minimization: minimize the entire structure with all best rotamers applied
+    # This produces a physically realistic final structure without steric clashes
+    if verbose:
+        print("\n" + "-"*60)
+        print("FINAL MINIMIZATION: Minimizing entire structure...")
+        print("-"*60)
+    
+    final_struct = working_struct
+    final_volume = current_volume
+    final_fa_rep = None
+    
+    if compute_wca:
+        final_min_result = minimize_full_structure(working_struct, verbose=verbose)
+        
+        if final_min_result.get('success'):
+            final_struct = final_min_result['minimized_struct']
+            final_fa_rep = final_min_result['total_fa_rep']
+            
+            # Compute final volume on minimized structure
+            final_vol_result = measure_binding_site_volume(
+                final_struct,
+                binding_site_residues,
+                min_contacts=min_contacts,
+                verbose=False
+            )
+            
+            if final_vol_result['success']:
+                final_volume = final_vol_result['total_volume']
+            
+            if verbose:
+                print(f"  Final minimized volume: {final_volume:.2f} Å^3")
+                print(f"  Final total fa_rep: {final_fa_rep:.2f} REU")
+        else:
+            if verbose:
+                print(f"  Warning: Final minimization failed, using non-minimized structure")
+    
     # Summary
     if verbose:
         print("\n" + "="*60)
         print("ROTAMER SAMPLING PHASE COMPLETE")
         print("="*60)
         print(f"\nResidues with valid rotamer data: {len(residue_rotamers)}")
-        print(f"Estimated optimized volume: {current_volume:.2f} Å^3")
-        print(f"Volume increase from initial: {current_volume - initial_volume:+.2f} Å^3")
+        print(f"Final optimized volume: {final_volume:.2f} Å^3")
+        print(f"Volume increase from initial: {final_volume - initial_volume:+.2f} Å^3")
+        if final_fa_rep is not None:
+            print(f"Final total fa_rep energy: {final_fa_rep:.2f} REU")
     
     result = {
         'residue_rotamers': {str(k): v for k, v in residue_rotamers.items()},
         'best_rotamers': {str(k): v for k, v in best_rotamers.items()},
-        'estimated_final_volume': current_volume,
-        'volume_increase': current_volume - initial_volume
+        'final_volume': final_volume,
+        'estimated_final_volume': current_volume,  # Keep for backwards compatibility
+        'volume_increase': final_volume - initial_volume,
+        'final_fa_rep': final_fa_rep,
     }
     
     # Save checkpoint
     if checkpoint_dir:
         save_rotamer_checkpoint(result, sorted_residues, checkpoint_dir)
     
-    return result, working_struct
+    return result, final_struct
 
 
 def save_rotamer_checkpoint(result, sorted_residues, checkpoint_dir):
