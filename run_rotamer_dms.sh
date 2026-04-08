@@ -141,4 +141,4 @@ cd "$SCRIPT_DIR"
 echo "Running RotamerDMS..."
 echo ""
 
-$SCHRODINGER/run python3 run_rotamer_dms.py "$@"
+$SCHRODINGER/run python3 /lustre/fs6/lyu_lab/scratch/dantan/RotamerDMS/run_rotamer_dms.py "$@"
